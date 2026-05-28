@@ -1,0 +1,177 @@
+//import OpenAI from 'openai';
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import multer from 'multer';
+import Groq from "groq-sdk";
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import dotenv from 'dotenv';
+import { ragChat } from '../services/ragService.js';
+
+// Load environment variables
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Configure OpenAI with explicit API key
+// const openai = new OpenAI({
+//     apiKey: process.env.OPENAI_API_KEY
+// });
+
+
+//const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+
+const groq = new Groq({
+  apiKey: process.env.GROK_API_KEY
+});
+
+// Configure Multer for file uploads
+const storage = multer.diskStorage({
+    destination: './uploads/',
+    filename: function (req, file, cb) {
+        cb(null, 'image-' + Date.now() + path.extname(file.originalname));
+    }
+});
+
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: 10000000 } // 10MB limit
+});
+
+export const chat = async (req, res) => {
+    try {
+        const userMessage = req.body.message;
+        const history = req.body.history || [];
+        const userId = req.user?._id;
+
+        // 1) Try RAG service first
+        try {
+            const ragResult = await ragChat(userMessage, userId);
+            if (ragResult && ragResult.response) {
+                return res.json({
+                    response: ragResult.response,
+                    ragUsed: !!ragResult.ragUsed,
+                    sourcesCount: ragResult.sourcesCount || 0,
+                    webUsed: !!ragResult.webUsed
+                });
+            }
+        } catch (ragErr) {
+            console.warn('[chat] RAG service unavailable, falling back to Groq:', ragErr?.message || ragErr);
+        }
+
+        // 2) Fallback: existing Groq chat logic
+        // Map frontend history to OpenAI format
+        const formattedHistory = history.map(msg => ({
+            role: msg.sender === 'user' ? 'user' : 'assistant',
+            content: msg.text
+        }));
+
+        // Prepend system prompt
+        // const messages = [
+        //     {
+        //         role: 'system',
+        //         content: 'You are a helpful assistant.'
+        //     },
+        //     ...formattedHistory
+        // ];
+
+
+    const messages = [
+      {
+        role: "system",
+        content: "You are a helpful assistant."
+      },
+      ...formattedHistory,
+      {
+        role: "user",
+        content: userMessage
+      }
+    ];
+
+
+
+
+
+
+        //      const prompt = `
+        // You are a helpful assistant.
+
+        // Conversation History:
+        // ${formattedHistory}
+
+        // User: ${userMessage}
+        // `;
+        // If no history, add the current user message
+        // if (formattedHistory.length === 0) {
+        //     messages.push({ role: 'user', content: userMessage });
+        // }
+
+        // const completion = await openai.chat.completions.create({
+        //     model: "gpt-3.5-turbo",
+        //     messages: messages,
+        //     max_tokens: 150
+        // });
+
+//         const model = genAI.getGenerativeModel({
+// model: "gemini-2.0-flash"
+// });
+
+
+//const result = await model.generateContent(messages.map(m => m.content).join("\n"));
+//const result = await model.generateContent(prompt);
+
+ const completion = await groq.chat.completions.create({
+     model: "llama-3.3-70b-versatile",
+      messages: messages,
+      max_tokens: 200
+    });
+
+
+
+//const botResponse = result.response.text();
+
+const botResponse = completion.choices[0].message.content;
+
+        res.json({
+            response: botResponse,
+            ragUsed: false,
+            sourcesCount: 0,
+            webUsed: false
+        });
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({
+            error: 'Something went wrong'
+        });
+    }
+};
+
+export const uploadImage = async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No image file uploaded' });
+        }
+
+        const imageUrl = `${process.env.BACKEND_URL}/uploads/${req.file.filename}`;
+        res.json({
+            success: true,
+            imageUrl: imageUrl
+        });
+    } catch (error) {
+        console.error('Error uploading image:', error);
+        res.status(500).json({ error: 'Failed to upload image' });
+    }
+};
+
+export const analyzeImage = async (req, res) => {
+    try {
+        res.json({
+            response: "I can see the image you uploaded. What would you like to know about it?"
+        });
+    } catch (error) {
+        console.error('Error analyzing image:', error);
+        res.status(500).json({ error: 'Failed to analyze image' });
+    }
+}; 
