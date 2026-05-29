@@ -1,0 +1,230 @@
+
+
+===PROMPT START===
+
+Hi. I am setting up a feature on my personal laptop that I built on my work laptop with the help of another AI assistant. I am going to give you the COMPLETE context of the project, the new feature, what files I am transferring, and what is left to do on this personal laptop. After this message I will ask follow-up questions as I run into problems. Please read all of this carefully before answering. Act as a senior full-stack engineer guiding me step by step. Keep answers focused and practical, not generic.
+
+============================================================
+PART 1 — THE BASE PROJECT (already existing on both laptops)
+============================================================
+
+The project is called CAMPUS CONNECT. It is a full-stack MERN platform for college students with these features:
+1. AI roadmap generator (uses Groq Llama 3.3 70B)
+2. Competitive programming leaderboard (scrapes LeetCode GraphQL and Codeforces REST)
+3. Discussion forum
+4. Profile / networking
+5. AI chatbot (currently uses Groq Llama 3.3 70B)
+
+Tech stack:
+- Backend: Node.js + Express + Mongoose + MongoDB Atlas + JWT in HTTP-only cookies + bcrypt
+- Frontend: React 18 + Vite + TailwindCSS + axios + react-router-dom v7
+- Auth: custom JWT, cookies are sameSite=None and secure=true for cross-origin
+- The Backend is normally hosted on Render and the frontend on Vercel/Netlify; locally it runs at:
+  - Backend  http://localhost:3000
+  - Frontend http://localhost:5173
+
+Existing folder structure (relevant parts):
+- Backend/
+    app.js
+    index.js
+    db/index.js
+    middlewares/authmiddleware.js
+    controllers/  (user, post, discussion, chat, roadmap, profile, leaderboard)
+    routes/       (one per controller area)
+    models/       (User, Post, Discussion, Leaderboard)
+- frontend/
+    src/pages/    (HomePage, Login, Register, Roadmap, DiscussionPage, ChatBotPage, LeaderboardPage, profilepage, etc.)
+    src/components/ (ChatBot, DiscussionCard, DiscussionModal, DiscussionDetails, Flowchart, ProfileCard, etc.)
+    src/services/api.js
+    src/utils/autcontext.jsx
+
+============================================================
+PART 2 — THE NEW FEATURE I AM ADDING (the RAG upgrade)
+============================================================
+
+I am adding a Retrieval-Augmented Generation (RAG) pipeline so the chatbot answers from real campus discussions plus live web data, instead of being a generic LLM.
+
+AI provider for the RAG pipeline:
+- GOOGLE GEMINI (not OpenAI, not Groq)
+- Embeddings: models/text-embedding-004  (768 dimensions, NOT 1536)
+- Generation:  gemini-1.5-flash
+- Library:     google-generativeai
+- API key env var: GEMINI_API_KEY (free at https://aistudio.google.com)
+
+Vector DB: MongoDB Atlas Vector Search (the same Mongo cluster the rest of the app uses). NOT Pinecone, NOT Weaviate. Atlas has native vector search via the $vectorSearch aggregation stage.
+
+Web search (optional): Tavily (https://tavily.com), free tier, used only when the query is about current/recent info or when no campus discussions match.
+
+ARCHITECTURE:
+
+The RAG pipeline lives entirely in a NEW Python FastAPI service called "rag-service" running on port 8001. It owns:
+- Gemini embeddings (text-embedding-004)
+- Gemini generation (gemini-1.5-flash)
+- MongoDB $vectorSearch via pymongo (its own Mongo connection, separate from Node’s Mongoose)
+- Tavily web search via tavily-python
+
+The Node backend stays as the user-facing API. When a chat request comes in, Node calls Python at POST /chat. Python does the full pipeline and returns the answer. If Python is down or fails, Node falls back to the existing Groq logic so the app never breaks.
+
+Flow on chat request:
+  user → React → POST /api/v1/chat/chat (Node)
+       → POST http://localhost:8001/chat (Python)
+           1. Gemini embed_query(message)
+           2. Mongo $vectorSearch over discussions collection
+           3. If no campus hits OR query mentions "latest/2024/2025/recent/etc", call Tavily
+           4. Gemini gemini-1.5-flash generates the final reply using one of 4 prompt templates (based on whether campus/web context is available)
+       → returns { response, ragUsed, sourcesCount, webUsed } → back to React
+       → ChatBot.jsx shows "✓ Based on N campus discussions" under bot replies when ragUsed=true
+
+Flow on discussion creation (indexing side):
+  user → React → POST /api/v1/discussion/ (Node)
+       → Mongoose creates the document
+       → Node fires-and-forgets POST http://localhost:8001/embed
+       → Python generates Gemini embedding from {title, content, tags, category} and writes it back to the same Mongo document via pymongo
+
+Discussion categories (new enum on the Discussion model):
+  ["competitive-programming", "interview-experience", "placement-prep",
+   "tech-discussion", "career-advice", "general"]
+  Default: "general". Category filter tabs added to the discussion page.
+
+Rate limit: 20 chat messages per hour per user, keyed on req.user._id (uses express-rate-limit).
+
+============================================================
+PART 3 — FILES I TRANSFERRED FROM MY WORK LAPTOP
+============================================================
+
+MODIFIED (existing files I overwrote on personal laptop):
+- Backend/app.js
+- Backend/models/Discussion.model.js
+- Backend/controllers/discussion.controllers.js
+- Backend/controllers/chatController.js
+- Backend/routes/chatRoutes.js
+- frontend/src/pages/DiscussionPage.jsx
+- frontend/src/components/DiscussionModal.jsx
+- frontend/src/components/ChatBot.jsx
+
+NEW Node files (pasted in fresh):
+- Backend/services/ragService.js          (thin axios client to Python /embed and /chat)
+- Backend/scripts/seedDiscussions.js      (seeds 25 realistic discussions, calls /embed for each)
+
+NEW Python service folder (pasted in fresh):
+- rag-service/main.py             (FastAPI app: /health, /embed, /chat)
+- rag-service/pipeline.py         (orchestrates embed → retrieve → web → generate)
+- rag-service/embedder.py         (Gemini embed wrapper with retrieval_document vs retrieval_query task types)
+- rag-service/generator.py        (Gemini gemini-1.5-flash with 4 prompt templates)
+- rag-service/retriever.py        (pymongo + $vectorSearch with 0.65 cosine threshold)
+- rag-service/web_search.py       (TavilyClient, degrades gracefully if key missing)
+- rag-service/requirements.txt    (fastapi, uvicorn, pymongo, google-generativeai, tavily-python, python-dotenv, pydantic)
+- rag-service/.env.example
+- rag-service/.gitignore
+- rag-service/README.md
+
+Discussion.model.js diff — added two fields, kept everything else:
+- category: enum (six values listed above), default "general", required
+- embedding: [Number] with select: false (never returned in normal queries)
+
+chatController.js diff — chat handler now:
+1. Tries  ragChat(message, userId) from ragService.js
+2. If RAG returns a response, returns it with ragUsed/sourcesCount/webUsed flags
+3. Else falls back to the existing Groq llama-3.3-70b-versatile chat call
+
+chatRoutes.js diff — POST /chat is now behind verifyjwt + express-rate-limit (20/hour per user).
+
+discussion.controllers.js diff:
+- createDiscussion accepts category field, fires embedDiscussion(newDiscussion).catch(...) after create (fire-and-forget, never blocks the response)
+- getDiscussions accepts ?category= query param; filters when not "all"
+
+DiscussionPage.jsx diff — added a horizontal category tab strip above the search bar with 6 tabs (All, CP, Interviews, Placements, Tech, Career); activeCategory state; passes category as query param.
+
+DiscussionModal.jsx diff — added a Category dropdown, defaults to "general", sends category in POST body.
+
+ChatBot.jsx diff — added ragUsed and sourcesCount state; renders "✓ Based on N campus discussions" in green text below bot replies when ragUsed=true.
+
+============================================================
+PART 4 — WHAT I HAVE ALREADY DONE ON THE PERSONAL LAPTOP
+============================================================
+
+(Fill this in honestly when you talk to ChatGPT. Example below — adjust to reality.)
+- ✅ Copied all files from my work laptop
+- ✅ Node and npm are installed (project already worked)
+- ❓ Python 3.12 — not sure if installed, need to check
+- ❓ Created rag-service/.env yet? — not yet
+- ❓ Atlas Vector Search index "discussion_embeddings" created? — not yet
+- ❓ Ran npm install express-rate-limit? — not yet
+- ❓ Ran pip install -r requirements.txt? — not yet
+- ❓ Seeded the 25 demo discussions? — not yet
+
+============================================================
+PART 5 — WHAT I STILL NEED TO DO
+============================================================
+
+1. Install Python 3.12 from https://www.python.org/downloads/. MUST tick "Add python.exe to PATH" during install. Verify in PowerShell with: python --version
+
+2. In Backend/, run:
+   npm install express-rate-limit
+
+3. In rag-service/, run:
+   pip install -r requirements.txt
+
+4. Create rag-service/.env with these three variables:
+   GEMINI_API_KEY=...     (get free at https://aistudio.google.com/apikey)
+   MONGODB_URL=...        (SAME connection string as Backend/.env)
+   TAVILY_API_KEY=...     (optional, free at https://tavily.com — skip if you don't want web search)
+
+5. In MongoDB Atlas → Atlas Search → Search Indexes → Create Search Index:
+   - Pick "Atlas Vector Search" (NOT the regular Atlas Search)
+   - JSON Editor
+   - Database: campus_connect, Collection: discussions
+   - Index name: discussion_embeddings  (must match exactly — code is hardcoded)
+   - JSON config:
+     {
+       "fields": [
+         { "type": "vector", "path": "embedding", "numDimensions": 768, "similarity": "cosine" }
+       ]
+     }
+   - numDimensions MUST be 768 (Gemini), not 1536 (OpenAI). Wait ~1 minute for status "Active".
+
+6. Run three terminals:
+   - Terminal 1:  cd rag-service && uvicorn main:app --reload --port 8001
+   - Terminal 2:  cd Backend     && npm start
+   - Terminal 3:  cd frontend    && npm run dev
+
+7. Verify Python health: open http://localhost:8001/health — should return {"status":"running","model":"gemini-1.5-flash","embedding":"text-embedding-004"}
+
+8. Seed 25 demo discussions (one-time, only after both Node and Python are running):
+   cd Backend
+   node scripts/seedDiscussions.js
+   (Skips if discussions collection already has 10+ documents.)
+
+9. Test in browser:
+   - Go to /discussion: see new category tab strip. Filter works.
+   - Click "New Discussion": see new Category dropdown.
+   - Go to /chatbot: ask something like "How was the TCS Digital interview?". Should reply with a green "✓ Based on N campus discussions" badge under it.
+
+If chatbot replies but no green badge appears → vector index isn't built yet, or seed wasn't run, or embeddings on the documents are missing. If chat completely fails → check Python service logs and Mongo connection.
+
+============================================================
+PART 6 — KEY THINGS YOU SHOULD KNOW WHEN HELPING ME
+============================================================
+
+- The chatbot has a GRACEFUL FALLBACK. If Python is down, Mongo $vectorSearch fails, Gemini quota runs out, or anything else explodes, Node catches the error and falls back to the existing Groq chat. So if I say "the chatbot works but no green badge", that means the fallback path is being used and RAG is broken somehow.
+- Python is the brain. Node is a thin HTTP client to Python for RAG paths. Don't suggest moving the RAG logic into Node.
+- The vector DB is MongoDB Atlas Vector Search, NOT Pinecone/Weaviate. We are using the SAME Mongo cluster the rest of the app already uses. Don't suggest adding a new vector DB.
+- Embeddings are 768-dim Gemini, NOT 1536-dim OpenAI. A lot of online tutorials assume OpenAI — please convert dimensions in your head before quoting any tutorial.
+- Embedder uses task_type="retrieval_document" when indexing a discussion and task_type="retrieval_query" when embedding a chat query. This is a Gemini-specific best practice that improves recall ~5-10%.
+- Cosine similarity threshold is 0.65 in retriever.py — anything below is filtered out as off-topic.
+- numCandidates is 30, limit is 5 in the $vectorSearch stage.
+- I am on Windows + PowerShell on this laptop. Give me PowerShell commands, not bash.
+
+============================================================
+PART 7 — HOW YOU SHOULD HELP ME
+============================================================
+
+I will ask follow-up questions one at a time. For each question:
+1. Diagnose what part of the system the problem is in (Python service / Node / Mongo / Atlas index / frontend / env vars).
+2. Give me the exact PowerShell command or exact code change to try.
+3. Tell me what success looks like so I know when it's fixed.
+4. If you don't have enough info, ask me to share specific log output or run a specific check command.
+
+Please confirm you have read this whole context. Then I will start asking my questions.
+
+===PROMPT END===
